@@ -62,3 +62,6 @@ def recent_history(n=5):
         except Exception: risk = "LOW"
         out.append({"title": r["title"], "mode": r["mode"], "created": r["created"], "risk": risk})
     return out
+
+def has_profile():
+    with conn() as c: return c.execute("SELECT 1 FROM profile WHERE id=1").fetchone() is not None

@@ -109,7 +109,7 @@ def match(profile, ext):
 
 PROMPT = """You analyze scholarship/opportunity text. Return ONLY JSON: {"extraction": {title, organization, country, type, level (High School|Bachelor|Master|PhD|Any),
 eligible_countries, min_age (int|null), max_age (int|null), academic_requirements, english_required (bool), language_requirements, funding,
-deadline (YYYY-MM-DD|null), required_documents [strings], link}, "risk": {"level": "LOW|MEDIUM|HIGH", "signals": [strings]},
+deadline (YYYY-MM-DD|null), required_documents [strings], link}, "risk": {"level": "LOW|MEDIUM|HIGH", "signals": [strings], "tiers": {"HIGH": [strings], "MEDIUM": [strings], "LOW": [strings]}},
 "checklist_extra": [strings], "summary": "2 sentences"}. Never say something is definitely a scam. Use only info in the text.\n\nTEXT:\n"""
 
 def _provider():
@@ -117,7 +117,11 @@ def _provider():
     p = os.getenv("LLM_PROVIDER", "").lower()
     return p if p in ("gemini", "anthropic") else ("gemini" if os.getenv("LLM_API_KEY", "").startswith("AIza") else "anthropic")
 
-def _call_llm(text):
+def _prompt(text, lang):
+    note = f"Write summary, risk signals/tiers and checklist_extra in {lang}. Keep JSON keys and extraction values faithful to the text.\n\nTEXT:\n"
+    return PROMPT.replace("TEXT:\n", note) + text[:6000]
+
+def _call_llm(text, lang="English"):
     key, model = os.environ["LLM_API_KEY"], os.getenv("LLM_MODEL", "")
     if _provider() == "gemini":
         first = "" if (not model or model.startswith("claude")) else model
@@ -126,7 +130,7 @@ def _call_llm(text):
             try:  # if a model is overloaded (503) or unknown (404), try the next one
                 r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{mdl}:generateContent", timeout=25,
                     headers={"x-goog-api-key": key, "content-type": "application/json"},
-                    json={"contents": [{"parts": [{"text": PROMPT + text[:6000]}]}], "generationConfig": {"responseMimeType": "application/json"}})
+                    json={"contents": [{"parts": [{"text": _prompt(text, lang)}]}], "generationConfig": {"responseMimeType": "application/json"}})
                 r.raise_for_status()
                 raw = "".join(p.get("text", "") for p in r.json()["candidates"][0]["content"]["parts"])
                 return json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
@@ -136,7 +140,7 @@ def _call_llm(text):
     else:
         r = requests.post("https://api.anthropic.com/v1/messages", timeout=60,
             headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": model or "claude-sonnet-4-6", "max_tokens": 1500, "messages": [{"role": "user", "content": PROMPT + text[:6000]}]})
+            json={"model": model or "claude-sonnet-4-6", "max_tokens": 1500, "messages": [{"role": "user", "content": _prompt(text, lang)}]})
         r.raise_for_status()
         raw = "".join(b.get("text", "") for b in r.json()["content"])
     return json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
@@ -161,15 +165,18 @@ def _clean(ext, base):
     if dl is not None and not pd.isna(dl): out["deadline"] = dl.date().isoformat()
     return out
 
-def analyze(text, profile):
+def analyze(text, profile, lang="English"):
     """Returns dict(mode, ext, risk, checklist, summary). Falls back to heuristics on any LLM failure."""
     ext, risk, extra, summary, mode, note = heuristic_extract(text), None, [], "", MODE_DEMO, ""
     if os.getenv("LLM_API_KEY"):
         try:
-            out = _call_llm(text)
+            out = _call_llm(text, lang)
             ext = _clean(out["extraction"], ext)
             if out["risk"]["level"].upper() in ("LOW", "MEDIUM", "HIGH"):
                 risk = {"level": out["risk"]["level"].upper(), "signals": out["risk"]["signals"]}
+                t = out["risk"].get("tiers")
+                if lang != "English" and isinstance(t, dict) and all(isinstance(t.get(k), list) for k in ("HIGH", "MEDIUM", "LOW")):
+                    risk["tiers"] = {k: [str(x) for x in t[k]] for k in ("HIGH", "MEDIUM", "LOW")}
             extra, summary, mode = out.get("checklist_extra", []), out.get("summary", ""), MODE_LLM
         except Exception as e:
             resp = getattr(e, "response", None); detail = ""
@@ -179,7 +186,7 @@ def analyze(text, profile):
             note = f"LLM unavailable ({type(e).__name__}{detail}); using fallback mode."
     htr = heuristic_risk(text, ext)
     if risk is None: risk = htr
-    else:
+    elif "tiers" not in risk:
         risk["tiers"] = {k: list(v) for k, v in htr["tiers"].items()}
         risk["tiers"][risk["level"]] += [x for x in risk["signals"] if x not in htr["signals"]]
     return {"mode": mode, "note": note, "ext": ext, "risk": risk, "summary": summary,
